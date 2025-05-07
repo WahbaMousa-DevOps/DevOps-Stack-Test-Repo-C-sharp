@@ -1,0 +1,51 @@
+pipeline {
+    agent any
+    environment {
+        IMAGE_NAME = 'yourdockerhubuser/your-dotnet-app'
+    }
+    stages {
+        stage('Checkout') {
+            steps {
+                echo 'Checking out the code...'
+                checkout scm
+            }
+        }
+        stage('Build') {
+            steps {
+                echo 'Building the application...'
+                sh 'dotnet build'
+            }
+        }
+        stage('Test') {
+            steps {
+                echo 'Running tests...'
+                sh 'dotnet test'
+            }
+        }
+        stage('Publish') {
+            steps {
+                echo 'Publishing the app...'
+                sh 'dotnet publish -c Release -o out'
+            }
+        }
+        stage('Docker Build & Push') {
+            steps {
+                script {
+                    docker.build("${IMAGE_NAME}", ".")
+                          .push()
+                }
+            }
+        }
+    }
+    post {
+        always {
+            cleanWs()
+        }
+        success {
+            echo 'Pipeline succeeded!'
+        }
+        failure {
+            echo 'Pipeline failed!'
+        }
+    }
+}
