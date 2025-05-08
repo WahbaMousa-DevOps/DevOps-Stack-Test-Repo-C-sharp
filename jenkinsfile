@@ -133,4 +133,69 @@ pipeline {
         
         stage('Scan Docker Image') {
             steps {
-                sh "trivy
+                sh "trivy image --severity HIGH,CRITICAL ${env.DOCKER_IMAGE_VERSION}"
+            }
+        }
+        
+        stage('Push Docker Image') {
+            when {
+                branch 'main'
+            }
+            steps {
+                withCredentials([usernamePassword(credentialsId: env.DOCKER_CREDENTIALS_ID, passwordVariable: 'DOCKER_PASSWORD', usernameVariable: 'DOCKER_USERNAME')]) {
+                    sh """
+                        echo "${DOCKER_PASSWORD}" | docker login -u "${DOCKER_USERNAME}" --password-stdin ${env.DOCKER_REGISTRY}
+                        docker push ${env.DOCKER_IMAGE_VERSION}
+                        docker push ${env.DOCKER_IMAGE_LATEST}
+                    """
+                }
+            }
+        }
+        
+        stage('Deploy to Development') {
+            when {
+                branch 'main'
+            }
+            steps {
+                echo "Deploying to dev environment..."
+                // This would typically involve Helm/Kubernetes or SSH to deploy to an EC2 instance
+                
+                // Example for EC2 deployment:
+                /*
+                withCredentials([sshUserPrivateKey(credentialsId: 'ec2-ssh-key', keyFileVariable: 'SSH_KEY')]) {
+                    sh """
+                        ssh -i ${SSH_KEY} -o StrictHostKeyChecking=no ubuntu@dev-server.example.com <<EOF
+                        docker pull ${env.DOCKER_IMAGE_VERSION}
+                        docker stop dotnet-app || true
+                        docker rm dotnet-app || true
+                        docker run -d --name dotnet-app -p 5000:80 ${env.DOCKER_IMAGE_VERSION}
+                        EOF
+                    """
+                }
+                */
+            }
+        }
+    }
+    
+    post {
+        always {
+            // Clean up local Docker images to save space
+            sh """
+                docker rmi ${env.DOCKER_IMAGE_VERSION} || true
+                docker rmi ${env.DOCKER_IMAGE_LATEST} || true
+                docker system prune -f || true
+            """
+            
+            // Archive artifacts
+            archiveArtifacts artifacts: 'publish/**/*', fingerprint: true
+            
+            // Send notifications
+            emailext (
+                subject: "Build ${currentBuild.currentResult}: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'",
+                body: """<p>Build Status: ${currentBuild.currentResult}</p>
+                <p>Build Number: ${env.BUILD_NUMBER}</p>
+                <p>Check console output at <a href='${env.BUILD_URL}'>${env.JOB_NAME} [${env.BUILD_NUMBER}]</a></p>""",
+                recipientProviders: [[$class: 'DevelopersRecipientProvider'], [$class: 'RequesterRecipientProvider']]
+            )
+        }
+    }
