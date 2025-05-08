@@ -1,78 +1,56 @@
 pipeline {
-    agent {
-        label 'dotnet'
-    }
-    
+    agent { label 'dotnet' }
+
     environment {
         DOCKER_REGISTRY = 'docker.io'
-        DOCKER_REPOSITORY = 'yourusername/csharp-sample-app'
+        DOCKER_REPOSITORY = 'wahbamousa/csharp-sample-app'
         DOCKER_CREDENTIALS_ID = 'dockerhub-credentials'
-        APP_VERSION = "${env.BUILD_NUMBER}"
         SONAR_PROJECT_KEY = 'csharp-sample-app'
+        APP_VERSION = "${env.BUILD_NUMBER}"
         DOTNET_CLI_HOME = "/tmp/dotnet_cli_home"
         DOTNET_CLI_TELEMETRY_OPTOUT = '1'
     }
-    
+
     options {
         timeout(time: 30, unit: 'MINUTES')
-        buildDiscarder(logRotator(numToKeepStr: '10'))
         disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
         timestamps()
     }
-    
+
     stages {
         stage('Checkout') {
-            steps {
-                checkout scm
-            }
+            steps { checkout scm }
         }
-        
-        stage('Set Build Variables') {
+
+        stage('Set Variables') {
             steps {
                 script {
-                    // Extract git commit hash
                     env.GIT_COMMIT_HASH = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
-                    
-                    // Define docker image tags
-                    env.DOCKER_IMAGE_TAG = "${env.GIT_COMMIT_HASH}-${env.BUILD_NUMBER}"
-                    env.DOCKER_IMAGE_LATEST = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPOSITORY}:latest"
-                    env.DOCKER_IMAGE_VERSION = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPOSITORY}:${env.DOCKER_IMAGE_TAG}"
-                    
-                    // Extract version from .csproj file
+                    env.DOCKER_IMAGE_TAG = "${GIT_COMMIT_HASH}-${BUILD_NUMBER}"
+                    env.DOCKER_IMAGE_VERSION = "${DOCKER_REGISTRY}/${DOCKER_REPOSITORY}:${DOCKER_IMAGE_TAG}"
+                    env.DOCKER_IMAGE_LATEST = "${DOCKER_REGISTRY}/${DOCKER_REPOSITORY}:latest"
                     env.PROJECT_VERSION = sh(script: '''
                         grep -oP '(?<=<Version>).*(?=</Version>)' Directory.Build.props || echo "1.0.0"
                     ''', returnStdout: true).trim()
                 }
-                echo "Building version: ${env.PROJECT_VERSION} (${env.DOCKER_IMAGE_TAG})"
             }
         }
-        
-        stage('Restore Packages') {
+
+        stage('Restore & Build') {
             steps {
                 sh 'dotnet restore --no-cache'
-            }
-        }
-        
-        stage('Build') {
-            steps {
                 sh 'dotnet build --no-restore -c Release'
             }
         }
-        
-        stage('Test') {
+
+        stage('Test & Coverage') {
             steps {
                 sh 'dotnet test --no-build --no-restore -c Release --logger "trx;LogFileName=test-results.trx" /p:CollectCoverage=true /p:CoverletOutputFormat=opencover /p:CoverletOutput=./coverage/'
             }
             post {
                 always {
-                    // Publish test results
-                    xunit (
-                        tools: [ MSTest(pattern: '**/TestResults/*.trx') ],
-                        thresholds: [ skipped(failureThreshold: '0'), failed(failureThreshold: '0') ],
-                        thresholdMode: 1
-                    )
-                    
-                    // Generate code coverage report
+                    xunit tools: [MSTest(pattern: '**/TestResults/*.trx')]
                     sh 'dotnet reportgenerator -reports:"./coverage/coverage.opencover.xml" -targetdir:"./coverage/report" -reporttypes:Html'
                     publishHTML(target: [
                         allowMissing: false,
@@ -85,23 +63,19 @@ pipeline {
                 }
             }
         }
-        
-        stage('Static Code Analysis') {
+
+        stage('SonarQube Analysis') {
             steps {
                 withSonarQubeEnv('SonarQube') {
-                    sh '''
-                        dotnet sonarscanner begin \
-                            /k:"${SONAR_PROJECT_KEY}" \
-                            /n:"${SONAR_PROJECT_KEY}" \
-                            /d:sonar.cs.opencover.reportsPaths="./coverage/coverage.opencover.xml" \
-                            /d:sonar.coverage.exclusions="**Tests*.cs"
+                    sh """
+                        dotnet sonarscanner begin /k:"${SONAR_PROJECT_KEY}" /n:"${SONAR_PROJECT_KEY}" /d:sonar.cs.opencover.reportsPaths="./coverage/coverage.opencover.xml"
                         dotnet build --no-restore -c Release
                         dotnet sonarscanner end
-                    '''
+                    """
                 }
             }
         }
-        
+
         stage('Quality Gate') {
             steps {
                 timeout(time: 10, unit: 'MINUTES') {
@@ -109,93 +83,61 @@ pipeline {
                 }
             }
         }
-        
+
         stage('Publish') {
             steps {
                 sh 'dotnet publish -c Release -o ./publish'
             }
         }
-        
+
         stage('Build Docker Image') {
             steps {
-                script {
-                    sh """
-                        docker build -t ${env.DOCKER_IMAGE_VERSION} \
-                            --build-arg APP_VERSION=${env.PROJECT_VERSION} \
-                            --build-arg BUILD_NUMBER=${env.BUILD_NUMBER} \
-                            --build-arg GIT_COMMIT=${env.GIT_COMMIT_HASH} \
-                            --no-cache -f Dockerfile .
-                        docker tag ${env.DOCKER_IMAGE_VERSION} ${env.DOCKER_IMAGE_LATEST}
-                    """
-                }
+                sh """
+                    docker build -t ${DOCKER_IMAGE_VERSION} \
+                      --build-arg APP_VERSION=${PROJECT_VERSION} \
+                      --build-arg BUILD_NUMBER=${BUILD_NUMBER} \
+                      --build-arg GIT_COMMIT=${GIT_COMMIT_HASH} \
+                      --no-cache -f Dockerfile .
+                    docker tag ${DOCKER_IMAGE_VERSION} ${DOCKER_IMAGE_LATEST}
+                """
             }
         }
-        
+
         stage('Scan Docker Image') {
             steps {
-                sh "trivy image --severity HIGH,CRITICAL ${env.DOCKER_IMAGE_VERSION}"
+                sh "trivy image --severity HIGH,CRITICAL ${DOCKER_IMAGE_VERSION}"
             }
         }
-        
+
         stage('Push Docker Image') {
-            when {
-                branch 'main'
-            }
+            when { branch 'main' }
             steps {
-                withCredentials([usernamePassword(credentialsId: env.DOCKER_CREDENTIALS_ID, passwordVariable: 'DOCKER_PASSWORD', usernameVariable: 'DOCKER_USERNAME')]) {
+                withCredentials([usernamePassword(credentialsId: DOCKER_CREDENTIALS_ID, usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
                     sh """
-                        echo "${DOCKER_PASSWORD}" | docker login -u "${DOCKER_USERNAME}" --password-stdin ${env.DOCKER_REGISTRY}
-                        docker push ${env.DOCKER_IMAGE_VERSION}
-                        docker push ${env.DOCKER_IMAGE_LATEST}
+                        echo "${DOCKER_PASSWORD}" | docker login -u "${DOCKER_USERNAME}" --password-stdin ${DOCKER_REGISTRY}
+                        docker push ${DOCKER_IMAGE_VERSION}
+                        docker push ${DOCKER_IMAGE_LATEST}
                     """
                 }
             }
         }
-        
-        stage('Deploy to Development') {
-            when {
-                branch 'main'
-            }
+
+        stage('Deploy (Placeholder)') {
+            when { branch 'main' }
             steps {
-                echo "Deploying to dev environment..."
-                // This would typically involve Helm/Kubernetes or SSH to deploy to an EC2 instance
-                
-                // Example for EC2 deployment:
-                /*
-                withCredentials([sshUserPrivateKey(credentialsId: 'ec2-ssh-key', keyFileVariable: 'SSH_KEY')]) {
-                    sh """
-                        ssh -i ${SSH_KEY} -o StrictHostKeyChecking=no ubuntu@dev-server.example.com <<EOF
-                        docker pull ${env.DOCKER_IMAGE_VERSION}
-                        docker stop dotnet-app || true
-                        docker rm dotnet-app || true
-                        docker run -d --name dotnet-app -p 5000:80 ${env.DOCKER_IMAGE_VERSION}
-                        EOF
-                    """
-                }
-                */
+                echo 'Deploy to dev server or K8s here...'
             }
         }
     }
-    
+
     post {
         always {
-            // Clean up local Docker images to save space
             sh """
-                docker rmi ${env.DOCKER_IMAGE_VERSION} || true
-                docker rmi ${env.DOCKER_IMAGE_LATEST} || true
+                docker rmi ${DOCKER_IMAGE_VERSION} || true
+                docker rmi ${DOCKER_IMAGE_LATEST} || true
                 docker system prune -f || true
             """
-            
-            // Archive artifacts
             archiveArtifacts artifacts: 'publish/**/*', fingerprint: true
-            
-            // Send notifications
-            emailext (
-                subject: "Build ${currentBuild.currentResult}: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'",
-                body: """<p>Build Status: ${currentBuild.currentResult}</p>
-                <p>Build Number: ${env.BUILD_NUMBER}</p>
-                <p>Check console output at <a href='${env.BUILD_URL}'>${env.JOB_NAME} [${env.BUILD_NUMBER}]</a></p>""",
-                recipientProviders: [[$class: 'DevelopersRecipientProvider'], [$class: 'RequesterRecipientProvider']]
-            )
         }
     }
+}
