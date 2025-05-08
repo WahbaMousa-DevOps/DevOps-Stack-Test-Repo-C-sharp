@@ -1,51 +1,136 @@
 pipeline {
-    agent any
-    environment {
-        IMAGE_NAME = 'yourdockerhubuser/your-dotnet-app'
+    agent {
+        label 'dotnet'
     }
+    
+    environment {
+        DOCKER_REGISTRY = 'docker.io'
+        DOCKER_REPOSITORY = 'yourusername/csharp-sample-app'
+        DOCKER_CREDENTIALS_ID = 'dockerhub-credentials'
+        APP_VERSION = "${env.BUILD_NUMBER}"
+        SONAR_PROJECT_KEY = 'csharp-sample-app'
+        DOTNET_CLI_HOME = "/tmp/dotnet_cli_home"
+        DOTNET_CLI_TELEMETRY_OPTOUT = '1'
+    }
+    
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        disableConcurrentBuilds()
+        timestamps()
+    }
+    
     stages {
         stage('Checkout') {
             steps {
-                echo 'Checking out the code...'
                 checkout scm
             }
         }
-        stage('Build') {
-            steps {
-                echo 'Building the application...'
-                sh 'dotnet build'
-            }
-        }
-        stage('Test') {
-            steps {
-                echo 'Running tests...'
-                sh 'dotnet test'
-            }
-        }
-        stage('Publish') {
-            steps {
-                echo 'Publishing the app...'
-                sh 'dotnet publish -c Release -o out'
-            }
-        }
-        stage('Docker Build & Push') {
+        
+        stage('Set Build Variables') {
             steps {
                 script {
-                    docker.build("${IMAGE_NAME}", ".")
-                          .push()
+                    // Extract git commit hash
+                    env.GIT_COMMIT_HASH = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                    
+                    // Define docker image tags
+                    env.DOCKER_IMAGE_TAG = "${env.GIT_COMMIT_HASH}-${env.BUILD_NUMBER}"
+                    env.DOCKER_IMAGE_LATEST = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPOSITORY}:latest"
+                    env.DOCKER_IMAGE_VERSION = "${env.DOCKER_REGISTRY}/${env.DOCKER_REPOSITORY}:${env.DOCKER_IMAGE_TAG}"
+                    
+                    // Extract version from .csproj file
+                    env.PROJECT_VERSION = sh(script: '''
+                        grep -oP '(?<=<Version>).*(?=</Version>)' Directory.Build.props || echo "1.0.0"
+                    ''', returnStdout: true).trim()
+                }
+                echo "Building version: ${env.PROJECT_VERSION} (${env.DOCKER_IMAGE_TAG})"
+            }
+        }
+        
+        stage('Restore Packages') {
+            steps {
+                sh 'dotnet restore --no-cache'
+            }
+        }
+        
+        stage('Build') {
+            steps {
+                sh 'dotnet build --no-restore -c Release'
+            }
+        }
+        
+        stage('Test') {
+            steps {
+                sh 'dotnet test --no-build --no-restore -c Release --logger "trx;LogFileName=test-results.trx" /p:CollectCoverage=true /p:CoverletOutputFormat=opencover /p:CoverletOutput=./coverage/'
+            }
+            post {
+                always {
+                    // Publish test results
+                    xunit (
+                        tools: [ MSTest(pattern: '**/TestResults/*.trx') ],
+                        thresholds: [ skipped(failureThreshold: '0'), failed(failureThreshold: '0') ],
+                        thresholdMode: 1
+                    )
+                    
+                    // Generate code coverage report
+                    sh 'dotnet reportgenerator -reports:"./coverage/coverage.opencover.xml" -targetdir:"./coverage/report" -reporttypes:Html'
+                    publishHTML(target: [
+                        allowMissing: false,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: './coverage/report',
+                        reportFiles: 'index.html',
+                        reportName: 'Code Coverage Report'
+                    ])
                 }
             }
         }
-    }
-    post {
-        always {
-            cleanWs()
+        
+        stage('Static Code Analysis') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh '''
+                        dotnet sonarscanner begin \
+                            /k:"${SONAR_PROJECT_KEY}" \
+                            /n:"${SONAR_PROJECT_KEY}" \
+                            /d:sonar.cs.opencover.reportsPaths="./coverage/coverage.opencover.xml" \
+                            /d:sonar.coverage.exclusions="**Tests*.cs"
+                        dotnet build --no-restore -c Release
+                        dotnet sonarscanner end
+                    '''
+                }
+            }
         }
-        success {
-            echo 'Pipeline succeeded!'
+        
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 10, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
         }
-        failure {
-            echo 'Pipeline failed!'
+        
+        stage('Publish') {
+            steps {
+                sh 'dotnet publish -c Release -o ./publish'
+            }
         }
-    }
-}
+        
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    sh """
+                        docker build -t ${env.DOCKER_IMAGE_VERSION} \
+                            --build-arg APP_VERSION=${env.PROJECT_VERSION} \
+                            --build-arg BUILD_NUMBER=${env.BUILD_NUMBER} \
+                            --build-arg GIT_COMMIT=${env.GIT_COMMIT_HASH} \
+                            --no-cache -f Dockerfile .
+                        docker tag ${env.DOCKER_IMAGE_VERSION} ${env.DOCKER_IMAGE_LATEST}
+                    """
+                }
+            }
+        }
+        
+        stage('Scan Docker Image') {
+            steps {
+                sh "trivy
