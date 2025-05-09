@@ -1,0 +1,19 @@
+
+*.dll
+*.pdb
+# Build output
+bin/
+obj/
+publish/
+
+# User files
+*.user
+*.suo
+
+# IDEs
+.vscode/
+.idea/
+
+# Logs and temp
+*.log
+*.tmp
