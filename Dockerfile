@@ -1,4 +1,10 @@
 # Build stage
+# Purpose: Builds the final deployable app image.
+# Used by Jenkins agent during pipeline (usually after dotnet publish).
+   # Stage 1: SDK image → build app.
+   # Stage 2: Runtime image → copy only final output (.dll), no SDK.
+# This final image is lightweight, safe for production. It contains only the compiled app and the runtime, no SDK or build tools.
+
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 WORKDIR /app
 
