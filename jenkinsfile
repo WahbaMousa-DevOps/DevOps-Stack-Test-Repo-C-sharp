@@ -1,13 +1,14 @@
+// Purpose: Build, test, scan, and push a C# (.NET) Dockerized app using the dotnet agent.
 pipeline {
     agent { label 'dotnet' }
 
-    environment {
-        DOCKER_REGISTRY = 'docker.io'
-        DOCKER_REPOSITORY = 'wahbamousa/csharp-sample-app'
-        DOCKER_CREDENTIALS_ID = 'dockerhub-credentials'
-        SONAR_PROJECT_KEY = 'csharp-sample-app'
+    environment { // Key Environment Variables:
+        DOCKER_REGISTRY = 'docker.io' // Where to push the image (e.g., Docker Hub)
+        DOCKER_REPOSITORY = 'wahbamousa/csharp-sample-app' // App-specific repo on Docker Hub
+        DOCKER_CREDENTIALS_ID = 'dockerhub-credentials' // Jenkins credential for DockerHub login
+        SONAR_PROJECT_KEY = 'csharp-sample-app' // Key for SonarQube scan
         APP_VERSION = "${env.BUILD_NUMBER}"
-        DOTNET_CLI_HOME = "/tmp/dotnet_cli_home"
+        DOTNET_CLI_HOME = "/tmp/dotnet_cli_home" // Isolated CLI cache path (to avoid permission issues)
         DOTNET_CLI_TELEMETRY_OPTOUT = '1'
     }
 
@@ -18,12 +19,12 @@ pipeline {
         timestamps()
     }
 
-    stages {
+    stages { // Pipeline Stages:
         stage('Checkout') {
-            steps { checkout scm }
+            steps { checkout scm } // Pulls code from GitHub (checkout scm)
         }
 
-        stage('Set Variables') {
+        stage('Set Variables') { // Sets GIT_COMMIT_HASH, DOCKER_IMAGE_TAG, and reads project version
             steps {
                 script {
                     env.GIT_COMMIT_HASH = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
@@ -37,14 +38,14 @@ pipeline {
             }
         }
 
-        stage('Restore & Build') {
+        stage('Restore & Build') { // Uses dotnet restore and dotnet build
             steps {
                 sh 'dotnet restore --no-cache'
                 sh 'dotnet build --no-restore -c Release'
             }
         }
 
-        stage('Test & Coverage') {
+        stage('Test & Coverage') { // Runs unit tests with coverage (coverlet) and generates HTML report
             steps {
                 sh 'dotnet test --no-build --no-restore -c Release --logger "trx;LogFileName=test-results.trx" /p:CollectCoverage=true /p:CoverletOutputFormat=opencover /p:CoverletOutput=./coverage/'
             }
@@ -64,7 +65,7 @@ pipeline {
             }
         }
 
-        stage('SonarQube Analysis') {
+        stage('SonarQube Analysis') { // Sends analysis and test coverage to SonarQube
             steps {
                 withSonarQubeEnv('SonarQube') {
                     sh """
@@ -76,7 +77,7 @@ pipeline {
             }
         }
 
-        stage('Quality Gate') {
+        stage('Quality Gate') { // Waits for SonarQube gate result
             steps {
                 timeout(time: 10, unit: 'MINUTES') {
                     waitForQualityGate abortPipeline: true
@@ -84,13 +85,13 @@ pipeline {
             }
         }
 
-        stage('Publish') {
+        stage('Publish') { // Publishes the final app binaries to ./publish
             steps {
                 sh 'dotnet publish -c Release -o ./publish'
             }
         }
 
-        stage('Build Docker Image') {
+        stage('Build Docker Image') { // Builds Docker image with build args and tags it
             steps {
                 sh """
                     docker build -t ${DOCKER_IMAGE_VERSION} \
@@ -103,13 +104,13 @@ pipeline {
             }
         }
 
-        stage('Scan Docker Image') {
+        stage('Scan Docker Image') { // Runs Trivy for security scanning (HIGH+CRITICAL)
             steps {
                 sh "trivy image --severity HIGH,CRITICAL ${DOCKER_IMAGE_VERSION}"
             }
         }
 
-        stage('Push Docker Image') {
+        stage('Push Docker Image') { // Pushes both versioned and latest tags to DockerHub (only on main)
             when { branch 'main' }
             steps {
                 withCredentials([usernamePassword(credentialsId: DOCKER_CREDENTIALS_ID, usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
@@ -122,7 +123,7 @@ pipeline {
             }
         }
 
-        stage('Deploy (Placeholder)') {
+        stage('Deploy (Placeholder)') { // Placeholder for deployment step
             when { branch 'main' }
             steps {
                 echo 'Deploy to dev server or K8s here...'
@@ -131,13 +132,13 @@ pipeline {
     }
 
     post {
-        always {
-            sh """
+        always { // Cleanup images + Docker cache
+            sh """ 
                 docker rmi ${DOCKER_IMAGE_VERSION} || true
                 docker rmi ${DOCKER_IMAGE_LATEST} || true
                 docker system prune -f || true
             """
-            archiveArtifacts artifacts: 'publish/**/*', fingerprint: true
+            archiveArtifacts artifacts: 'publish/**/*', fingerprint: true // Archive published files
         }
     }
 }
