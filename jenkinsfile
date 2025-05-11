@@ -1,59 +1,282 @@
 // Purpose: Build, test, scan, and push a C# (.NET) Dockerized app using the dotnet agent.
 pipeline {
+    parameters {
+        booleanParam(name: 'TEST_MODE', defaultValue: false, description: 'Run pipeline in test mode (skips deployment)')
+        booleanParam(name: 'SKIP_TESTS', defaultValue: false, description: 'Skip running tests')
+        booleanParam(name: 'SKIP_SONAR', defaultValue: false, description: 'Skip SonarQube analysis')
+            booleanParam(name: 'ALLOW_VULNERABLE_BUILD', defaultValue: false, description: 'Allow build to continue despite vulnerabilities') // Allows skipping failure when vulnerable packages are detected — useful in dev or with exception approval
+
+    }
     agent { label 'dotnet' }
-
-    environment { // Key Environment Variables:
-        DOCKER_REGISTRY = 'docker.io' // Where to push the image (e.g., Docker Hub)
-        DOCKER_REPOSITORY = 'wahbamousa/csharp-sample-app' // App-specific repo on Docker Hub
-        DOCKER_CREDENTIALS_ID = 'dockerhub-credentials' // Jenkins credential for DockerHub login
-        SONAR_PROJECT_KEY = 'csharp-sample-app' // Key for SonarQube scan
-        APP_VERSION = "${env.BUILD_NUMBER}"
-        DOTNET_CLI_HOME = "/tmp/dotnet_cli_home" // Isolated CLI cache path (to avoid permission issues)
-        DOTNET_CLI_TELEMETRY_OPTOUT = '1'
+    environment { //  environment variables that will be available only during pipeline execution — they are not global Jenkins variables:
+        DOCKER_REGISTRY = 'docker.io' // Registry address, Where to push the image (e.g., Docker Hub)
+        DOCKER_REPOSITORY = 'wahbamousa/csharp-sample-app' // Name of your image (including namespace)
+        DOCKER_CREDENTIALS_ID = 'dockerhub-credentials' // Jenkins credential for DockerHub login, it comes from JCASC under $(DOCKERHUB_USERNAME), $(DOCKERHUB_PASSWORD) (must match one in jenkins.yaml)
+        SONAR_PROJECT_KEY = 'csharp-sample-app' // SonarQube project UI ID identifier "Key for SonarQube scan". must match key configured in sonarqube server so if ok, analysis results will appear under the project.
+       //APP_VERSION = "v${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}-${BRANCH_NAME}-${GIT_COMMIT_HASH}" // BUILD_NUMBER is a Jenkins built-in environment variable. It auto-increments every time a pipeline runs. Example: If you run a job for the third time, BUILD_NUMBER=3. APP_VERSION used in tagging Docker images or artifacts: myapp:3
+        DOTNET_CLI_HOME = "/tmp/dotnet_cli_home" // .NETSDK use a default path as /home/jenkins/.dotnet to store temporary cli files so this Isolated CLI cache path only during build, Sets dotnet CLI home to avoid issues with user permissions inside docker or agent containers especially if running as jenkins user.
+        DOTNET_CLI_TELEMETRY_OPTOUT = '1' // disables sending telementary data to microsoft from the .NET CLI.
+        PIPELINE_START_TIME = "${System.currentTimeMillis()}" // For measuring pipeline duration
+        ASPNETCORE_ENVIRONMENT = 'Production' // Ensures production-specific behavior in runtime (e.g., logging, configs)
+        DOTNET_EnableDiagnostics = 'false'    // Disables .NET diagnostic server for reduced attack surface
+        NUGET_RETRIES = '3'                   // Retry NuGet commands up to 3 times
+        NUGET_RETRY_DELAY_MILLISECONDS = '1000' // Delay between retries in ms
+          // Environment-specific configurations
+            DEPLOY_TARGET = [ //Dynamic environment mode from branch name
+                'main': 'production',
+                'staging': 'staging',
+                'develop': 'development'
+            ].get(env.BRANCH_NAME, 'development')
+            
+            // Resource limits based on environment
+            MAX_MEMORY = "${DEPLOY_TARGET == 'production' ? '8192' : '4096'}"
+            
+            // Security scanning strictness by environment
+            VULNERABILITY_SEVERITY = "${DEPLOY_TARGET == 'production' ? 'MEDIUM,HIGH,CRITICAL' : 'HIGH,CRITICAL'}" // Dynamic environment mode from branch name
     }
-
-    options {
-        timeout(time: 30, unit: 'MINUTES')
-        disableConcurrentBuilds()
-        buildDiscarder(logRotator(numToKeepStr: '10'))
-        timestamps()
+    options { // This block controls pipeline behavior and housekeeping.
+        timeout {// Prevents builds from hanging forever. Meaning: If a pipeline runs longer than 30 minutes, Jenkins automatically aborts it.
+            // Add stage-specific timeouts
+        time: 30
+        unit: 'MINUTES'
+        activity: true // This enables inactivity timeout
+                }
+        disableConcurrentBuilds(abortPrevious: true) // Ensures only one build per branch is running, Prevents the same job from running in parallel. so, If someone triggers a build while one is already running → Jenkins queues it instead of running both.  Useful to avoid file conflicts, Docker tag clashes, or test database reuse.
+        buildDiscarder(logRotator(numToKeepStr: '10', artifactNumToKeepStr: '5')) // Keep 10 builds, 5 with artifacts, Automatically cleans up old builds. Keeps only the last 10 builds.  Saves disk space and speeds up UI loading.
+        timestamps() // Adds timestamps to every line of the console output. Useful for debugging (knowing exactly when each step started).
+        ansiColor('xterm') // Enables colored console logs for better readability
+         lock('dotnet-resources') // Prevents builds from racing over same tools/resources
+        retry(2) // Retries pipeline if transient errors
+        skipDefaultCheckout(true) // We’ll do custom checkout with depth/timeout controls
     }
-
     stages { // Pipeline Stages:
         stage('Checkout') {
-            steps { checkout scm } // Pulls code from GitHub (checkout scm)
-        }
+            steps { 
+                // Shallow clone for faster fetch
+                checkout([ // Pulls code from GitHub. Use the Git SCM plugin to Automatically clone the repo where the Jenkinsfile lives, Checkout the branch/commit that triggered the build. 
+                    //  It’s essential in multibranch pipelines — it ensures you’re working with the correct source code for that branch.
+                    $class: 'GitSCM',
+                    branches: scm.branches,
+                    extensions: [
+                        [$class: 'CloneOption', depth: 1, noTags: false, shallow: true, timeout: 5],
+                        [$class: 'SubmoduleOption', disableSubmodules: false, recursiveSubmodules: true]
+                    ],
+                    userRemoteConfigs: scm.userRemoteConfigs
+                ])
 
-        stage('Set Variables') { // Sets GIT_COMMIT_HASH, DOCKER_IMAGE_TAG, and reads project version
-            steps {
+                // Secrets scanning with git-secrets and gitleaks
+                sh '''
+                   command -v git-secrets >/dev/null 2>&1 || { echo "git-secrets is required in CI. Aborting."; exit 1; }
+                        git secrets --register-aws || true
+                        git secrets --scan || (echo "CRITICAL: Secrets found in codebase!" && exit 1)
+
+
+                   command -v gitleaks >/dev/null 2>&1 || { echo "gitleaks is required in CI. Aborting."; exit 1; }
+                    gitleaks detect --source . --verbose || (echo "CRITICAL: Secrets found in codebase!" && exit 1)
+
+
+                    find . -type f -size +10M | grep -v '.git/' > large_files.txt
+                    if [ -s large_files.txt ]; then
+                        echo "WARNING: Large files found in repository:"
+                        cat large_files.txt
+                    fi
+                ''' // Detects large files that slow clone or CI
+
+                // Git author, commit, and date for traceability and for auditing
                 script {
-                    env.GIT_COMMIT_HASH = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
-                    env.DOCKER_IMAGE_TAG = "${GIT_COMMIT_HASH}-${BUILD_NUMBER}"
-                    env.DOCKER_IMAGE_VERSION = "${DOCKER_REGISTRY}/${DOCKER_REPOSITORY}:${DOCKER_IMAGE_TAG}"
-                    env.DOCKER_IMAGE_LATEST = "${DOCKER_REGISTRY}/${DOCKER_REPOSITORY}:latest"
-                    env.PROJECT_VERSION = sh(script: '''
-                        grep -oP '(?<=<Version>).*(?=</Version>)' Directory.Build.props || echo "1.0.0"
-                    ''', returnStdout: true).trim()
+                    try {
+                        def branchName = sh(script: 'git rev-parse --abbrev-ref HEAD', returnStdout: true).trim()
+                        echo "Building branch: ${branchName}"
+
+                        env.GIT_AUTHOR = sh(script: 'git log -1 --pretty=format:"%an <%ae>"', returnStdout: true).trim()
+                        env.GIT_COMMIT_MSG = sh(script: 'git log -1 --pretty=format:"%s"', returnStdout: true).trim()
+                        env.GIT_COMMIT_DATE = sh(script: 'git log -1 --pretty=format:"%ad" --date=iso', returnStdout: true).trim()
+                        echo "Commit by: ${env.GIT_AUTHOR}"
+                    } catch (e) {
+                        echo "Failed to get Git metadata: ${e.message}"
+                    }
                 }
             }
         }
-
-        stage('Restore & Build') { // Uses dotnet restore and dotnet build
+        stage('Set Variables') { // Dynamically sets build metadata used in later stages (like Docker tagging, versioning, etc.). Sets GIT_COMMIT_HASH, DOCKER_IMAGE_TAG, and reads project version
             steps {
-                sh 'dotnet restore --no-cache'
-                sh 'dotnet build --no-restore -c Release'
+                script {
+                    env.APP_VERSION = "v${env.VERSION_MAJOR}.${env.VERSION_MINOR}.${env.VERSION_PATCH}-${env.DEPLOY_ENVIRONMENT}-${env.GIT_COMMIT_HASH}"
+                    env.GIT_COMMIT_HASH = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim() // Gets the short Git commit hash (e.g., a1b2c3d) — useful for traceable Docker tags.
+                    env.DOCKER_IMAGE_TAG = "${GIT_COMMIT_HASH}-${BUILD_NUMBER}" // Combines the commit hash with Jenkins build number → e.g., a1b2c3d-15
+                    env.DOCKER_IMAGE_VERSION = "${DOCKER_REGISTRY}/${DOCKER_REPOSITORY}:${DOCKER_IMAGE_TAG}" // Creates a fully-qualified Docker tag: docker.io/wahbamousa/csharp-sample-app:a1b2c3d-15
+                    env.DOCKER_IMAGE_LATEST = "${DOCKER_REGISTRY}/${DOCKER_REPOSITORY}:latest" // Defines the latest tag version for Docker push
+                    // Extract version safely
+                    try {
+                        env.PROJECT_VERSION = sh(script: '''
+                            grep -oP '(?<=<Version>).*(?=</Version>)' Directory.Build.props 2>/dev/null
+                        ''', returnStdout: true).trim() // Reads the version number from a .NET config file (Directory.Build.props), Fallbacks to 1.0.0 if not found, Used as the APP_VERSION or passed into Docker build args.
+                        if (!env.PROJECT_VERSION) {
+                            env.PROJECT_VERSION = sh(script: '''
+                                grep -oP '(?<=<Version>).*(?=</Version>)' *.csproj 2>/dev/null || \
+                                grep -oP '(?<=<AssemblyVersion>).*(?=</AssemblyVersion>)' *.csproj 2>/dev/null
+                            ''', returnStdout: true).trim()
+                        }
+
+                        if (!env.PROJECT_VERSION) {
+                            env.PROJECT_VERSION = "1.0.0-b${BUILD_NUMBER}"
+                            echo "No version found. Using fallback: ${env.PROJECT_VERSION}"
+                        }
+                    } catch (e) {
+                        env.PROJECT_VERSION = "1.0.0-b${BUILD_NUMBER}"
+                        echo "Error finding version: ${e.message}"
+                    }
+
+                    def versionParts = env.PROJECT_VERSION.tokenize('.-+')
+                    env.VERSION_MAJOR = versionParts.size() > 0 ? versionParts[0] : "1"
+                    env.VERSION_MINOR = versionParts.size() > 1 ? versionParts[1] : "0"
+                    env.VERSION_PATCH = versionParts.size() > 2 ? versionParts[2] : "0"
+
+                    // Intelligent project fingerprinting
+                    env.CACHE_KEY = sh(script: '''
+                        (
+                            find . -name "*.csproj" -o -name "*.props" -o -name "packages.config" | sort | xargs cat 2>/dev/null | md5sum | cut -d " " -f1
+                            test -f NuGet.config && md5sum NuGet.config | cut -d " " -f1 || echo "no-nuget-config"
+                            test -f Directory.Packages.props && md5sum Directory.Packages.props | cut -d " " -f1 || echo "no-package-props"
+                        ) | md5sum | cut -d " " -f1
+                    ''', returnStdout: true).trim()
+
+                    env.DOTNET_MAX_CPUS = sh(script: 'nproc || echo 4', returnStdout: true).trim()
+                    env.MAX_MEMORY = sh(script: 'free -m | grep Mem | awk \'{print int($2 * 0.8)}\'', returnStdout: true).trim()
+
+                    def branch = env.BRANCH_NAME ?: sh(script: 'git rev-parse --abbrev-ref HEAD', returnStdout: true).trim()
+                    env.DEPLOY_ENVIRONMENT = branch == 'main' ? 'production' :
+                                            branch == 'staging' ? 'staging' :
+                                            branch.startsWith('release/') ? 'uat' : 'development'
+
+                    echo """
+                    ===========================================
+                    BUILD METADATA:
+                    - Version: ${env.PROJECT_VERSION}
+                    - Commit: ${env.GIT_COMMIT_HASH}
+                    - Author: ${env.GIT_AUTHOR ?: 'Unknown'}
+                    - Environment: ${env.DEPLOY_ENVIRONMENT}
+                    - Cache Key: ${env.CACHE_KEY}
+                    ===========================================
+                    """
+                }
             }
         }
-
-        stage('Test & Coverage') { // Runs unit tests with coverage (coverlet) and generates HTML report
+        stage('Audit Setup') {
             steps {
-                sh 'dotnet test --no-build --no-restore -c Release --logger "trx;LogFileName=test-results.trx" /p:CollectCoverage=true /p:CoverletOutputFormat=opencover /p:CoverletOutput=./coverage/'
+                script {
+                    // Create audit record
+                    def auditData = [
+                        'pipeline_id': env.BUILD_TAG,
+                        'started_by': currentBuild.getBuildCauses()[0].shortDescription,
+                        'branch': env.BRANCH_NAME,
+                        'commit': env.GIT_COMMIT_HASH,
+                        'start_time': new Date().format("yyyy-MM-dd'T'HH:mm:ss.SSSZ"),
+                        'environment': env.DEPLOY_ENVIRONMENT
+                    ]
+                    
+                    writeJSON file: 'pipeline-audit.json', json: auditData // Record who triggered pipeline and when
+                }
             }
+           
             post {
+                    always {
+                        script {
+                            // Update audit record with completion status
+                            def auditData = readJSON file: 'pipeline-audit.json'
+                            auditData.put('end_time', new Date().format("yyyy-MM-dd'T'HH:mm:ss.SSSZ"))
+                            auditData.put('status', currentBuild.result)
+                            auditData.put('duration_ms', System.currentTimeMillis() - env.PIPELINE_START_TIME.toLong())
+                            
+                            writeJSON file: 'pipeline-audit.json', json: auditData // Appends duration & result
+                            archiveArtifacts artifacts: 'pipeline-audit.json', fingerprint: true
+                        }
+                    }
+                }
+        }
+        stage('Dependency Audit') {
+                steps {
+                    sh 'dotnet list package --vulnerable || true' // Basic vulnerability report
+                    // Optional: Block build on vulnerable packages
+                    // sh 'dotnet list package --vulnerable | grep -q "has the following vulnerable packages" && exit 1 || true'
+                                        sh '''
+                        echo "Checking for vulnerable NuGet packages..."
+                        dotnet list package --vulnerable --include-transitive > nuget-audit.txt || true
+
+                        echo "Checking NuGet licenses..."
+                        dotnet list package --include-transitive | grep -i "license" > package-licenses.txt || true
+
+                        echo "Checking for outdated/unmaintained packages..."
+                        dotnet list package --outdated | tee outdated-packages.txt || true
+
+                        if command -v dependency-check.sh >/dev/null 2>&1; then
+                            dependency-check.sh --project "C# App" --scan . --out dependency-check-report.html || true
+                        fi
+
+                        VULN_COUNT=$(grep -c "has the following vulnerable packages" nuget-audit.txt || echo "0")
+                        if [ "$VULN_COUNT" -gt "0" ]; then
+                            echo "WARNING: $VULN_COUNT vulnerable package sets detected!"
+                        fi
+
+                        if [ "$VULN_COUNT" -gt "0" ]; then
+                            echo "Vulnerabilities found. Checking policy..."
+
+                            if [ "$DEPLOY_ENVIRONMENT" = "production" ]; then
+                                if [ ! -f .vuln-exceptions ]; then
+                                    echo "ERROR: Vulnerabilities found in production and no exception file present."
+                                    exit 1
+                                fi
+                            else
+                                if [ "${ALLOW_VULNERABLE_BUILD}" != "true" ]; then
+                                    echo "ERROR: Vulnerabilities found and override not allowed (ALLOW_VULNERABLE_BUILD=false)."
+                                    exit 1
+                                fi
+                            fi
+                        fi
+
+                    ''' // Enforces strict rules in prod, and optional override in dev
+                    archiveArtifacts artifacts: '*-audit.txt,*-packages.txt,*-report.html,package-licenses.txt', allowEmptyArchive: true
+
+                }
+        }  
+        stage('Restore & Build') { // UThis stage is used to prepare and compile the C# project using the .NET CLI.
+            steps { // restore then build because if fail early then there's a problem with NuGet or locked packages then if success then Build only if restore succeeds, ensures clean dependency resolution.
+                sh 'dotnet restore --no-cache' // Restores "Fetches all required NuGet packages" NuGet packages (dependencies listed in .csproj, .sln, or Directory.Packages.props). --no-cache ensures: Fresh download of all packages, Avoids using stale packages from a previous build. Use this in CI to guarantee consistency and detect any broken package feeds.
+                sh 'dotnet build --no-restore -c Release' // Compiles the app "using already-restored packages" in Release configuration. --no-restore tells the CLI not to restore packages again, because you already did it in the previous step. Keeps the build fast and clean.
+            }
+        }
+        stage('Test & Coverage') { // RPurpose: Run unit tests and generate a code coverage report for .NET apps using: dotnet test (with Coverlet) - reportgenerator - "xunit + publishHTML" (for UI reports)
+                             when { expression { return !params.SKIP_TESTS } }
+
+            steps {
+                    sh '''
+                    dotnet test --no-build --no-restore -c Release \
+                    --logger "trx;LogFileName=test-results.trx" \
+                    /p:CollectCoverage=true \
+                    /p:CoverletOutputFormat=opencover \
+                    /p:CoverletOutput=./coverage/ \
+                    /p:ParallelizeTestCollections=${DOTNET_TEST_PARALLELIZATION} \
+                    /p:MaxParallelThreads=4 \
+                    --blame-hang-timeout 60s \
+                    --blame-crash
+                    '''
+                }
+                // Avoids repeating previous steps (faster CI) - Runs tests in Release mode - Generates test results in .trx format (for xUnit plugin) - Enables code coverage collection via Coverlet - Exports coverage as OpenCover (required by Sonar/reportgenerator) - Stores results in ./coverage/coverage.opencover.xml
+            post { // Runs after the test step, no matter if the tests pass or fail.
                 always {
-                    xunit tools: [MSTest(pattern: '**/TestResults/*.trx')]
-                    sh 'dotnet reportgenerator -reports:"./coverage/coverage.opencover.xml" -targetdir:"./coverage/report" -reporttypes:Html'
-                    publishHTML(target: [
+                    script {
+                        def durationMillis = System.currentTimeMillis() - env.PIPELINE_START_TIME.toLong()
+                        def durationMinutes = durationMillis / 60000
+                        echo "Pipeline completed in ${durationMinutes.round(2)} minutes"
+                           }
+                        sh '''
+                                if [ -d TestResults ]; then
+                                    find TestResults -name "*.coverage" -o -name "*.blame" | xargs ls -la || true
+                                fi
+                            ''' // Helps investigate slow/crashed test runs.
+                    xunit tools: [MSTest(pattern: '**/TestResults/*.trx')] // Parse test results, Uses the .trx file from dotnet test, Parses it to show pass/fail test cases in the Jenkins UI
+                    sh 'dotnet reportgenerator -reports:"./coverage/coverage.opencover.xml" -targetdir:"./coverage/report" -reporttypes:Html' // // Generate coverage report, Converts raw opencover XML to readable HTML report, Output will be at ./coverage/report/index.html
+                    publishHTML(target: [ //  Publish HTML report, Makes the HTML coverage report visible in Jenkins UI → left sidebar. keepAll: true → keeps old build reports too
                         allowMissing: false,
                         alwaysLinkToLastBuild: true,
                         keepAll: true,
@@ -62,83 +285,239 @@ pipeline {
                         reportName: 'Code Coverage Report'
                     ])
                 }
+                  failure {
+            script {
+                def failedStage = currentBuild.result
+                def buildLog = currentBuild.rawBuild.getLog(1000).join('\n')
+                
+                // Extract error patterns
+                def errorPattern = ~/error:|exception:|failed:/
+                def errors = buildLog.readLines().findAll { it =~ errorPattern }
+                
+                echo "Build failed in stage: ${failedStage}"
+                echo "Error summary:\n${errors.take(10).join('\n')}"
+                
+                // Uncomment for Slack notification
+                // slackSend channel: '#builds', 
+                //    color: 'danger', 
+                //    message: "Build failed: ${JOB_NAME} #${BUILD_NUMBER}\nFailed in: ${failedStage}\nErrors: ${errors.size()}"
             }
+    
+            }}
         }
+        stage('Parallel Static & Build') {
+            parallel {
+                stage('SonarQube Analysis') { // Runs static code analysis with SonarQube and Sends analysis and test coverage to SonarQube
+                    options { timeout(time: 5, unit: 'MINUTES') }
+                    when { expression { return !params.SKIP_SONAR } }
+                    steps {
+                        withSonarQubeEnv('SonarQube') { // Initializes analysis session and sets up context/config, -k, -n Project key + name (used in SonarQube UI), /d: Points to the coverage report from Coverlet (.opencover.xml) - Required — Sonar hooks into build to collect analyzable data - Sends all collected data to SonarQube server.
+                
+                retry(3) { // Retry Sonar analysis if it fails due to temporary issues
+                        sh """
+                            echo "Starting SonarQube analysis..."
+                            dotnet sonarscanner begin /k:"${SONAR_PROJECT_KEY}" /n:"${SONAR_PROJECT_KEY}" /d:sonar.cs.opencover.reportsPaths="./coverage/coverage.opencover.xml"
+                            dotnet build --no-restore -c Release
+                            dotnet sonarscanner end
+                        """
+                    }
+            
+                    }
+                }
+                }
+                stage('Build Docker Image') { //  Purpose: Builds the Docker image for your app with build args and tags it, passing build metadata for traceability.
+                        steps { // -t ${} Tags the image (e.g., myapp:commit-123) - --build-arg Injects build metadata into the Docker image (used in Dockerfile ARG) - --no-cache Ensures a clean build every time - -f Uses specified Dockerfile from root context
+                                            // Check Dockerfile for security best practices
+                    sh '''
+                        if command -v hadolint >/dev/null 2>&1; then
+                            echo "Scanning Dockerfile with hadolint..."
+                            hadolint Dockerfile || echo "Hadolint detected issues"
+                        else
+                            echo "hadolint not installed"
+                        fi
 
-        stage('SonarQube Analysis') { // Sends analysis and test coverage to SonarQube
-            steps {
-                withSonarQubeEnv('SonarQube') {
-                    sh """
-                        dotnet sonarscanner begin /k:"${SONAR_PROJECT_KEY}" /n:"${SONAR_PROJECT_KEY}" /d:sonar.cs.opencover.reportsPaths="./coverage/coverage.opencover.xml"
-                        dotnet build --no-restore -c Release
-                        dotnet sonarscanner end
-                    """
+                        # Check for important security practices
+                        grep -q "USER " Dockerfile || echo "WARNING: No USER set - image may run as root"
+                        grep -q "HEALTHCHECK" Dockerfile || echo "WARNING: No HEALTHCHECK in Dockerfile"
+                        
+                        # Verify no insecure defaults or credentials
+                        ! grep -q "chmod 777" Dockerfile || echo "WARNING: chmod 777 detected in Dockerfile"
+                        ! grep -E -q "(password|token|key|secret).*=" Dockerfile || echo "WARNING: Potential credential in Dockerfile"
+                    ''' // Security linter for Dockerfile + manual checks
+                    sh 'rm -rf obj bin tests TestResults || true'
+
+                    sh "docker pull ${DOCKER_IMAGE_LATEST} || true"
+
+                            sh """
+                                export DOCKER_BUILDKIT=1
+                            docker build \
+                --cache-from=${DOCKER_IMAGE_LATEST} \
+                -t ${DOCKER_IMAGE_VERSION} \
+                -t ${DOCKER_IMAGE_LATEST} \
+                --build-arg APP_VERSION=${PROJECT_VERSION} \
+                --build-arg BUILD_NUMBER=${BUILD_NUMBER} \
+                --build-arg GIT_COMMIT=${GIT_COMMIT_HASH} \
+                --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+                --label "org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+                --label "org.opencontainers.image.revision=${GIT_COMMIT_HASH}" \
+                --label "org.opencontainers.image.version=${PROJECT_VERSION}" \
+                --no-cache -f Dockerfile .
+                                """ // tag ${} Adds a second tag: latest for easy reference. This makes your images traceable + human-readable + clean.
+                            } // Added OCI labels and build args for traceability
+                        }
+            }
+            }
+            stage('Quality Gate') { // Purpose: Waits for SonarQube gate result to finish analyzing and report if the build passed the quality gate (code smells, vulnerabilities, coverage thresholds, etc.)
+                steps {
+                    timeout(time: 10, unit: 'MINUTES') { // Waits max 10 min (prevents hanging jobs)
+                        waitForQualityGate abortPipeline: true // Fails the build if the gate fails
+                    }
                 }
             }
-        }
 
-        stage('Quality Gate') { // Waits for SonarQube gate result
-            steps {
-                timeout(time: 10, unit: 'MINUTES') {
-                    waitForQualityGate abortPipeline: true
+            stage('Publish') { // Purpose: Creates the final compiled app package, ready for deployment or Docker image build. Publishes the final app binaries to ./publish
+                steps {
+                    sh 'dotnet publish -c Release -o ./publish' // -c Builds optimized, production-ready version -o Outputs binaries to ./publish/ folder
+                        // Generate checksum for binary artifacts
+            sh '''
+                cd publish
+                find . -type f -name "*.dll" -o -name "*.exe" | xargs sha256sum > ../checksums.txt
+            '''
+            
+            // Generate SBOM (Software Bill of Materials)
+                        sh 'dotnet CycloneDX ./MySolution.sln -o . -f -j || echo "SBOM generation requires CycloneDX tool"' // Generates CycloneDX SBOM if dotnet-cyclonedx is installed.
+
                 }
+                post {
+            always {
+                archiveArtifacts artifacts: 'checksums.txt', fingerprint: true
             }
         }
+        }
+        stage('Scan Docker Image') { // Runs Trivy to scan the built Docker image for known vulnerabilities for security scanning (HIGH+CRITICAL)
+                    steps {
+                        sh "trivy image --exit-code 1 --severity HIGH,CRITICAL ${DOCKER_IMAGE_VERSION}"
+                        sh "trivy image --exit-code 0 --severity MEDIUM ${DOCKER_IMAGE_VERSION} || true"
+                        sh "trivy image --format cyclonedx --output sbom-container.json ${DOCKER_IMAGE_VERSION}" // Generates CycloneDX SBOM for container
+                    }   // Scans only for HIGH and CRITICAL CVEs, Scans your just-built image
+                    post {
+                        always {
+                            archiveArtifacts artifacts: 'sbom-container.json', fingerprint: true, allowEmptyArchive: true
+                        }
+                    }
+                          } //  Essential DevSecOps step to block vulnerable builds before release.
 
-        stage('Publish') { // Publishes the final app binaries to ./publish
-            steps {
-                sh 'dotnet publish -c Release -o ./publish'
-            }
-        }
+        stage('Health Check') {
+                    steps {
+                        script {
+                            try { // More robust health check with retries and better container cleanup
+                                sh '''
+                                    CONTAINER_ID=$(docker run -d -p 8080:80 --name health-check-${BUILD_NUMBER} --health-cmd "curl -f http://localhost:80/health || exit 1" ${DOCKER_IMAGE_VERSION})
+                                    echo "Starting health check for container ${CONTAINER_ID}"
 
-        stage('Build Docker Image') { // Builds Docker image with build args and tags it
-            steps {
-                sh """
-                    docker build -t ${DOCKER_IMAGE_VERSION} \
-                      --build-arg APP_VERSION=${PROJECT_VERSION} \
-                      --build-arg BUILD_NUMBER=${BUILD_NUMBER} \
-                      --build-arg GIT_COMMIT=${GIT_COMMIT_HASH} \
-                      --no-cache -f Dockerfile .
-                    docker tag ${DOCKER_IMAGE_VERSION} ${DOCKER_IMAGE_LATEST}
-                """
-            }
-        }
+                                    # Give the application time to start
+                                    sleep 5
 
-        stage('Scan Docker Image') { // Runs Trivy for security scanning (HIGH+CRITICAL)
-            steps {
-                sh "trivy image --severity HIGH,CRITICAL ${DOCKER_IMAGE_VERSION}"
-            }
-        }
+                                    # Retry health check multiple times
+                                    HEALTHY=false
+                                    for i in {1..5}; do
+                                        HEALTH_STATUS=$(docker inspect --format='{{.State.Health.Status}}' $CONTAINER_ID 2>/dev/null || echo "error")
+                                        
+                                        if [ "$HEALTH_STATUS" = "healthy" ]; then
+                                            HEALTHY=true
+                                            echo "Container is healthy!"
+                                            break
+                                        elif [ "$HEALTH_STATUS" = "starting" ]; then
+                                            echo "Container still starting (attempt $i/5)..."
+                                            sleep 5
+                                        else
+                                            echo "Container health check failed with status: $HEALTH_STATUS (attempt $i/5)"
+                                            docker logs $CONTAINER_ID
+                                            sleep 5
+                                        fi
+                                    done
+
+                                    # Always clean up the container
+                                    docker rm -f $CONTAINER_ID || true
+
+                                    if [ "$HEALTHY" = "false" ]; then
+                                        echo "Container failed health check after multiple attempts"
+                                        exit 1
+                                    fi
+                                ''' // Healthcheck with retries ensures the container is actually ready
+                            } catch (e) {
+                                echo "Health check failed but continuing: ${e.message}"
+                            }
+                        }
+                    }
+                }
+
 
         stage('Push Docker Image') { // Pushes both versioned and latest tags to DockerHub (only on main)
-            when { branch 'main' }
-            steps {
-                withCredentials([usernamePassword(credentialsId: DOCKER_CREDENTIALS_ID, usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
+            when { branch 'main' } // Only runs this stage if the build is on the main branch (prevents pushing test/dev builds)
+            steps { // Pulls Docker Hub credentials securely from Jenkins credentials (DOCKER_CREDENTIALS_ID)
+          withCredentials([usernamePassword(credentialsId: DOCKER_CREDENTIALS_ID, usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
+                retry(2) {
                     sh """
-                        echo "${DOCKER_PASSWORD}" | docker login -u "${DOCKER_USERNAME}" --password-stdin ${DOCKER_REGISTRY}
+                        if [ "${DOCKER_REGISTRY}" != "https://"* ] && [ "${DOCKER_REGISTRY}" != "docker.io" ]; then
+                            echo "WARNING: Non-HTTPS Docker registry URLs may pose security risks."
+                        fi
+                        docker login -u "${DOCKER_USERNAME}" -p "${DOCKER_PASSWORD}" ${DOCKER_REGISTRY} > /dev/null 2>&1
                         docker push ${DOCKER_IMAGE_VERSION}
                         docker push ${DOCKER_IMAGE_LATEST}
+                        docker logout ${DOCKER_REGISTRY}
                     """
-                }
+                        }
+                        }// Logs in securely (no passwords in logs). Pushes both the versioned and latest tag. Keeps your Docker Hub repo clean, updated, and traceable.
+                            sh '''
+                    if command -v cosign >/dev/null 2>&1; then
+                        cosign sign --key cosign.key ${DOCKER_IMAGE_VERSION} || echo "Image signing skipped"
+                    else
+                        echo "Cosign not installed, skipping image signing"
+                    fi
+                '''
+                archiveArtifacts artifacts: 'sbom-container.json,cosign.pub,cosign.key', fingerprint: true, allowEmptyArchive: true // Preserve SBOM and signing info
+                echo "SBOM and signatures archived. Ready for external publishing." // Optional: tells user files are ready: Upload to GitHub or Artifactory (external automation needed)
+
             }
         }
-
-        stage('Deploy (Placeholder)') { // Placeholder for deployment step
+        stage('Deploy (Placeholder)') { // Placeholder for deployment step. Just a placeholder. In a real setup, you'd deploy using: kubectl apply -f ..., ansible-playbook ..., terraform apply, az webapp deploy ... etc. Clearly marks where CD (Continuous Deployment) logic will go.
             when { branch 'main' }
             steps {
-                echo 'Deploy to dev server or K8s here...'
-            }
+                input message: "Approve deployment to production?" // Manual approval before deploying to prod
+                echo 'Deploying...'
+                    }
         }
-    }
-
     post {
-        always { // Cleanup images + Docker cache
-            sh """ 
-                docker rmi ${DOCKER_IMAGE_VERSION} || true
-                docker rmi ${DOCKER_IMAGE_LATEST} || true
-                docker system prune -f || true
-            """
-            archiveArtifacts artifacts: 'publish/**/*', fingerprint: true // Archive published files
+            always { // Cleanup & Archiving, Cleanup images + Docker cache. Cleans up the workspace and Docker cache to: Free disk space and Avoid leftover dangling images/layers.
+                    // Archives published binaries (e.g., DLLs or deployable files) for: Traceability and Future re-use (e.g., manual deploys or test restores). Ensures clean agents and keeps build output traceable.
+                sh """ 
+                echo "Cleaning up Docker images..."
+                if docker rmi ${DOCKER_IMAGE_VERSION}; then
+                    echo "Successfully removed ${DOCKER_IMAGE_VERSION}"
+                else
+                    echo "Warning: Failed to remove ${DOCKER_IMAGE_VERSION} or it didn't exist"
+                fi
+                
+                if docker rmi ${DOCKER_IMAGE_LATEST}; then
+                    echo "Successfully removed ${DOCKER_IMAGE_LATEST}"
+                else
+                    echo "Warning: Failed to remove ${DOCKER_IMAGE_LATEST} or it didn't exist"
+                fi
+                
+                echo "Pruning Docker system..."
+                docker system prune -f
+                """ // Clean up Docker artifacts to save space
+                archiveArtifacts artifacts: 'publish/*.dll,publish/*.exe', allowEmptyArchive: true, fingerprint: true // Archive published files, Store binaries for later deploy/test
+            }
+            success {
+                echo "Pipeline succeeded! Image: ${DOCKER_IMAGE_VERSION}"
+                // slackSend channel: '#builds', color: 'good', message: "Build passed: ${JOB_NAME} #${BUILD_NUMBER}"
         }
+            failure {
+                echo "Pipeline failed."
+                // slackSend channel: '#builds', color: 'danger', message: "Build failed: ${JOB_NAME} #${BUILD_NUMBER}"
+            }
     }
+}
 }
