@@ -1,19 +1,65 @@
+# Build results
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
 
+# Visual Studio temporary files
+.vs/
+*.user
+*.userosscache
+*.sln.docstates
+
+# .NET
+project.lock.json
+project.fragment.lock.json
+artifacts/
+**/Properties/launchSettings.json
+
+# Test Results
+[Tt]est[Rr]esult*/
+[Bb]uild[Ll]og.*
+*.VisualState.xml
+TestResult.xml
+nunit-*.xml
+
+# Build artifacts
 *.dll
+*.exe
 *.pdb
-# Build output
-bin/
-obj/
 publish/
 
-# User files
-*.user
-*.suo
+# Docker
+.dockerignore
+*.tar
 
-# IDEs
-.vscode/
+# IDE
 .idea/
+.vscode/
+*.swp
+*.swo
 
-# Logs and temp
-*.log
-*.tmp
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment files (these should be ignored!)
+.env
+.env.local
+.env.*.local
+
+# User-specific files
+*.suo
+*.user
+*.userosscache
+*.sln.docstates

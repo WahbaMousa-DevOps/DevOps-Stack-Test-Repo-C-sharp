@@ -1,0 +1,32 @@
+schemaVersion: 2.0.0
+fileExistenceTests:
+  - name: 'Check if app dll exists'
+    path: '/app/csharp-hello.dll'
+    shouldExist: true
+  - name: 'Check if runtime is present'
+    path: '/usr/share/dotnet/shared/Microsoft.NETCore.App'
+    shouldExist: true
+
+fileContentTests:
+  - name: 'Check app configuration'
+    path: '/app/appsettings.json'
+    expectedContents: ['.*"Logging".*', '.*"AllowedHosts".*']
+
+commandTests:
+  - name: 'Test dotnet command'
+    command: 'dotnet'
+    args: ['--info']
+    exitCode: 0
+  - name: 'Test app starts'
+    command: 'dotnet'
+    args: ['/app/csharp-hello.dll']
+    exitCode: 0
+
+metadataTest:
+  env:
+    - key: 'ASPNETCORE_URLS'
+      value: 'http://+:80'
+    - key: 'DOTNET_RUNNING_IN_CONTAINER'
+      value: 'true'
+  exposedPorts: ['80']
+  user: 'app'
