@@ -1,0 +1,6 @@
+@DevOps_Stack_Test_Repo_C_sharp_HostAddress = http://localhost:5148
+
+GET {{DevOps_Stack_Test_Repo_C_sharp_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

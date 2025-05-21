@@ -1,5 +1,3 @@
- # workflow_dispatch  # Only run manually, disable workflows in .github/workflows/ temporarily with it.
-
 name: CI - CSharp App
 
 on:
@@ -13,6 +11,7 @@ on:
     branches:
       - main
       - develop
+ # workflow_dispatch  # Only run manually, disable workflows in .github/workflows/ temporarily with it.
 
 env:
   DOTNET_CLI_TELEMETRY_OPTOUT: 1

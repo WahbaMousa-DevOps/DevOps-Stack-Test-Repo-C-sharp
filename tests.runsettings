@@ -1,3 +1,5 @@
+ <!-- A test configuration file for MSTest or Visual Studio Test Explorer. Used to control test execution, parallelism, code coverage, and environment variables.  to run automated tests (especially in CI)
+-->
 <?xml version="1.0" encoding="utf-8"?>
 <RunSettings>
   <!-- Configurations for running tests -->
