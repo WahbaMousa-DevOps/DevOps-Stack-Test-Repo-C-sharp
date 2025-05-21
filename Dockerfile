@@ -14,8 +14,10 @@ RUN dotnet publish -c Release -o /app/publish --no-restore
 # -----------------------------------
 # RUNTIME STAGE (toggle via ARG)
 # -----------------------------------
-ARG RUNTIME_IMAGE
+
+ARG RUNTIME_IMAGE=mcr.microsoft.com/dotnet/aspnet:8.0
 FROM ${RUNTIME_IMAGE} AS runtime
+
 
 WORKDIR /app
 COPY --from=build /app/publish .
