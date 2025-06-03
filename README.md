@@ -1,5 +1,7 @@
 # DevOps-Stack-Test-Repo-C-sharp
 
+# Add pranch protections + enforce + API CALL
+
 ## 📘 Enterprise-Grade CI/CD Pipeline for .NET (C#) Apps with Jenkins
 
 This repository showcases a **complete DevSecOps pipeline** for building, testing, scanning, and deploying a Dockerized C# (.NET) application using **Jenkins Declarative Pipelines**.

@@ -26,6 +26,15 @@ jobs:
     with:
       language: dotnet
 
+  trivy:
+    uses: WahbaMousa-DevOps/CENTRALIZED-GITHUB-ACTIONS/.github/workflows/trivy.yml@main
+    with:
+      language: dotnet
+        
+  lint:
+    uses: WahbaMousa-DevOps/CENTRALIZED-GITHUB-ACTIONS/.github/workflows/lint.yml@main
+    with:
+      language: dotnet
   sbom:
     uses: WahbaMousa-DevOps/CENTRALIZED-GITHUB-ACTIONS/.github/workflows/sbom.yml@main
     with:
@@ -34,17 +43,10 @@ jobs:
       DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
       DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
 
-  publish:
-    uses: WahbaMousa-DevOps/CENTRALIZED-GITHUB-ACTIONS/.github/workflows/publish.yml@main
-    with:
-      language: dotnet
-    secrets:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
   notify:
     uses: WahbaMousa-DevOps/CENTRALIZED-GITHUB-ACTIONS/.github/workflows/notify.yml@main
     with:
-      status: "✅ Success"
+      status: "Success"
       message: ".NET CI pipeline finished successfully."
     secrets:
       SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}

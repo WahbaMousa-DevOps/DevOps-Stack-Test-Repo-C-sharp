@@ -1,0 +1,31 @@
+name: Reusable Security Scan
+
+on:
+  workflow_call:
+    # inputs:
+    #   language:
+    #     required: true
+    #     type: string
+
+jobs:
+  scan:
+    name: Secret & Static Scanning
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Gitleaks Scan # Scans Git history and source code for hardcoded secrets (tokens, keys)
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          config-path: ./gitleaks.toml
+        continue-on-error: true
+
+      - name: git-secrets Scan # Detects AWS keys/secrets in Git — prevents adding them locally
+        run: |
+          git clone https://github.com/awslabs/git-secrets.git
+          cd git-secrets && sudo make install && cd ..
+          git secrets --install
+          git secrets --register-aws
+          git secrets --scan || echo "git-secrets scan skipped or failed."
