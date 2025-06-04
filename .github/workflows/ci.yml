@@ -31,13 +31,13 @@ jobs:
 
   trivy:
     uses: WahbaMousa-DevOps/CENTRALIZED-GITHUB-ACTIONS/.github/workflows/trivy.yml@main
-    with:
-      language: dotnet
+
+  codeql:
+    uses: WahbaMousa-DevOps/CENTRALIZED-GITHUB-ACTIONS/.github/workflows/codeql.yml@main
         
   lint:
     uses: WahbaMousa-DevOps/CENTRALIZED-GITHUB-ACTIONS/.github/workflows/lint.yml@main
-    with:
-      language: dotnet
+
   sbom:
     uses: WahbaMousa-DevOps/CENTRALIZED-GITHUB-ACTIONS/.github/workflows/sbom.yml@main
     with:
