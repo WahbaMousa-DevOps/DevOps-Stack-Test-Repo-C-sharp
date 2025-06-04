@@ -9,7 +9,7 @@ on:
 
 jobs:
   build:
-    uses: WahbaMousa-DevOps/CENTRALIZED-GITHUB-ACTIONS/.github/workflows/build.yml@main
+    uses: WahbaMousa-DevOps/CENTRALIZED-GITHUB-ACTIONS/.github/workflows/build.yml@main #called from the app repo, but runs inside the app repo context, not the central repo.
     with:
       language: dotnet
     secrets:

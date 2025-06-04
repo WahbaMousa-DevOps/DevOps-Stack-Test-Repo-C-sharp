@@ -12,14 +12,20 @@ COPY . ./
 RUN dotnet publish -c Release -o /app/publish --no-restore
 
 # -----------------------------------
-# RUNTIME STAGE (toggle via ARG)
+# RUNTIME STAGE
 # -----------------------------------
 
+# ARG PROD_RUNTIME_IMAGE=mcr.microsoft.com/dotnet/aspnet:8.0-jammy-chiseled
 ARG RUNTIME_IMAGE=mcr.microsoft.com/dotnet/aspnet:8.0
 FROM ${RUNTIME_IMAGE} AS runtime
 
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 
 WORKDIR /app
 COPY --from=build /app/publish .
+
+RUN chown -R appuser:appgroup /app
+
+USER appuser
 
 ENTRYPOINT ["dotnet", "DevOps-Stack-Test-Repo-C-sharp.dll"]
