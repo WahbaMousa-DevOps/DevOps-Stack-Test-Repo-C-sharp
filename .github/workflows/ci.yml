@@ -25,6 +25,9 @@ jobs:
     uses: WahbaMousa-DevOps/CENTRALIZED-GITHUB-ACTIONS/.github/workflows/scan.yml@main
     with:
       language: dotnet
+    secrets:
+      READ_PAT: ${{ secrets.READ_PAT }}
+      SLACK_SECURITY_BOT_TOKEN: ${{ secrets.SLACK_SECURITY_BOT_TOKEN }} 
 
   trivy:
     uses: WahbaMousa-DevOps/CENTRALIZED-GITHUB-ACTIONS/.github/workflows/trivy.yml@main
