@@ -28,4 +28,8 @@ RUN chown -R appuser:appgroup /app
 
 USER appuser
 
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD curl --fail http://localhost/health || exit 1
+
+
 ENTRYPOINT ["dotnet", "DevOps-Stack-Test-Repo-C-sharp.dll"]
